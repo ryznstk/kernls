@@ -13,6 +13,7 @@
 #include "manager/manager_observer.h"
 #include "manager/throne_tracker.h"
 #include "hook/syscall_hook_manager.h"
+#include "hook/lsm_hook.h"
 #include "runtime/ksud.h"
 #include "runtime/ksud_boot.h"
 #include "supercall/supercall.h"
@@ -20,11 +21,15 @@
 #include "infra/file_wrapper.h"
 #include "selinux/selinux.h"
 #include "hook/syscall_hook.h"
+#include "feature/adb_root.h"
+#include "feature/selinux_hide.h"
+#include "infra/symbol_resolver.h"
 
 #ifdef CONFIG_KSU_SUSFS
 #include <linux/susfs.h>
 #include "hook/setuid_hook.h"
 #include "feature/sucompat.h"
+extern void ksu_avc_spoof_late_init(void);
 #endif
 
 #if defined(__x86_64__)
@@ -75,8 +80,19 @@ __attribute__((naked)) int __init kernelsu_init_early(void)
 struct cred *ksu_cred;
 bool ksu_late_loaded;
 
+#ifdef CONFIG_KSU_DEBUG
+bool allow_shell = true;
+#else
+bool allow_shell = false;
+#endif
+module_param(allow_shell, bool, 0);
+
 int __init kernelsu_init(void)
 {
+#ifdef CONFIG_KSU_SUSFS
+	susfs_init();
+#endif // #ifdef KSU_SUSFS
+
 #if defined(__x86_64__)
     // If the kernel has the hardening patch, X86_FEATURE_INDIRECT_SAFE must be set 
     if (!boot_cpu_has(X86_FEATURE_INDIRECT_SAFE)) {
@@ -108,11 +124,16 @@ int __init kernelsu_init(void)
 	pr_alert("**     NOTICE NOTICE NOTICE NOTICE NOTICE NOTICE NOTICE    **");
 	pr_alert("*************************************************************");
 #endif
+	if (allow_shell) {
+		pr_alert("shell is allowed at init!");
+	}
 
-    ksu_cred = prepare_creds();
-    if (!ksu_cred) {
-        pr_err("prepare cred failed!\n");
-    }
+	ksu_cred = prepare_creds();
+	if (!ksu_cred) {
+		pr_err("prepare cred failed!\n");
+	}
+
+	ksu_init_symbol_resolver();
 
 #if !defined(CONFIG_KSU_SUSFS) && defined(CONFIG_KPROBES)
 	ksu_syscall_hook_init();
@@ -120,10 +141,19 @@ int __init kernelsu_init(void)
 
 	ksu_feature_init();
 
+#ifndef CONFIG_KSU_SUSFS
+#ifdef CONFIG_KPROBES
+	ksu_lsm_hook_init();
+#endif
+#endif
+
+	ksu_selinux_hide_init();
+
+	ksu_adb_root_init();
+
 	ksu_supercalls_init();
 
 #ifdef CONFIG_KSU_SUSFS
-	susfs_init();
 	ksu_sucompat_init();
 	ksu_setuid_hook_init();
 	ksu_avc_spoof_init();
@@ -154,6 +184,11 @@ int __init kernelsu_init(void)
 
 		ksu_boot_completed = true;
 		track_throne(false);
+
+		#ifdef CONFIG_KSU_SUSFS
+		ksu_avc_spoof_late_init();
+		#endif
+		ksu_selinux_hide_drop_backup_if_unused();
 
 		if (!getenforce()) {
 			pr_info("Permissive SELinux, enforcing\n");
@@ -209,6 +244,16 @@ void __exit kernelsu_exit(void)
 	ksu_sucompat_exit();
 	ksu_setuid_hook_exit();
 #endif
+
+	ksu_selinux_hide_exit();
+
+#ifndef CONFIG_KSU_SUSFS
+#ifdef CONFIG_KPROBES
+	ksu_lsm_hook_exit();
+#endif
+#endif
+
+	ksu_adb_root_exit();
 
 	ksu_feature_exit();
 
